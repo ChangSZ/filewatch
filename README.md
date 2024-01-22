@@ -7,6 +7,14 @@ filewatch is a file harvester, mostly used to fetch logs files and feed them int
 ## Quick start
 
 ```go
+package main
+
+import (
+	"fmt"
+
+	"github.com/ChangSZ/filewatch"
+)
+
 func main() {
 	watcher := filewatch.NewWatcher()
 	watcher.SetCompleteMarker("***")
@@ -22,6 +30,7 @@ func main() {
 	}()
 	watcher.Start()
 }
+
 ```
 
 

@@ -6,6 +6,14 @@ filewatch是一个文件监控&文件内容收集器。 通常用来监控日志
 # 快速开始
 
 ```go
+package main
+
+import (
+	"fmt"
+
+	"github.com/ChangSZ/filewatch"
+)
+
 func main() {
 	watcher := filewatch.NewWatcher()
 	watcher.SetCompleteMarker("***")
@@ -21,6 +29,7 @@ func main() {
 	}()
 	watcher.Start()
 }
+
 ```
 
 # 贡献
