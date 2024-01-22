@@ -1,10 +1,9 @@
 # filewatch
-[中文](./README_cn.md)
+[English](./README.md)
 
-filewatch is a file harvester, mostly used to fetch logs files and feed them into other components.
+filewatch是一个文件监控&文件内容收集器。 通常用来监控日志文件，并将内容发送给其他组件
 
-
-## Quick start
+# 快速开始
 
 ```go
 func main() {
@@ -24,7 +23,6 @@ func main() {
 }
 ```
 
+# 贡献
 
-## Contributions
-
-If you have an issue, found a bug or have a feature request, go ahead!
+如果你有一个Issue、发现了一个Bug或者有一个MR, 请不要吝啬, 甩出来！
