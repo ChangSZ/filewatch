@@ -2,6 +2,7 @@ package filewatch
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"io"
 	"os"
@@ -9,7 +10,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -17,23 +17,24 @@ import (
 )
 
 const (
-	DefaultDirPath        = "./logs" // 需要被监控的文件夹
-	DefaultFileRegexp     = `.+.log` // 需要被监控的文件名正则表达式
-	DefaultCompleteMarker = "LOG_COMPLETE"
+	DefaultDirPath         = "./logs"       // 需要被监控的文件夹
+	DefaultFileRegexp      = `.+.log`       // 需要被监控的文件名正则表达式
+	DefaultCompleteMarker  = "LOG_COMPLETE" // 文件监控结束标志符
+	DefaultMaxNoUpdateTime = 4 * time.Hour  // 文件最大未更新时长
 )
 
 const (
 	CursorFileSuffix = ".cursor"
 )
 
-var (
-	scanOnce sync.Once // 只扫描一次
-)
-
 type FileContent struct {
 	FilePath string
-	Content  string
+	Content  []byte
 	EOF      bool
+}
+
+func (f FileContent) String() string {
+	return fmt.Sprintf("filePath: %v, Content: %s, EOF: %v", f.FilePath, f.Content, f.EOF)
 }
 
 type FileWatcher struct {
@@ -42,6 +43,7 @@ type FileWatcher struct {
 	completeMarker      string
 	watching            int64
 	removeAfterComplete bool
+	maxNoUpdateTime     time.Duration
 	ResChan             chan FileContent
 }
 
@@ -65,6 +67,11 @@ func (w *FileWatcher) SetRemoveAfterComplete(remove bool) {
 	w.removeAfterComplete = remove
 }
 
+// SetMaxNoUpdateTime 设置文件最大未更新时间, 用来结束监控协程
+func (w *FileWatcher) SetMaxNoUpdateTime(dur time.Duration) {
+	w.maxNoUpdateTime = dur
+}
+
 // GetResChan 获取结果通道
 func (w *FileWatcher) GetResChan() <-chan FileContent {
 	return w.ResChan
@@ -77,6 +84,7 @@ func NewWatcher() *FileWatcher {
 		fileRegexp:          DefaultFileRegexp,
 		completeMarker:      DefaultCompleteMarker,
 		removeAfterComplete: false,
+		maxNoUpdateTime:     DefaultMaxNoUpdateTime,
 		ResChan:             make(chan FileContent),
 	}
 	return watcher
@@ -88,6 +96,13 @@ func (w *FileWatcher) Start() (err error) {
 		fmt.Printf("文件夹(%s)正在被监控中, 无需再起监控任务\n", w.dirPath)
 		return nil
 	}
+
+	go w.Scan()
+	defer func() {
+		if err == fsnotify.ErrEventOverflow {
+			go w.Start()
+		}
+	}()
 
 	defer func() {
 		swapped := atomic.CompareAndSwapInt64(&w.watching, 1, 0)
@@ -158,38 +173,34 @@ func (w *FileWatcher) Start() (err error) {
 	}
 }
 
-// Scan 扫描一次目录, 适用于服务首次或重启时运行一次
+// Scan 扫描一次目录
 func (w *FileWatcher) Scan() {
-	scanOnce.Do(
-		func() {
-			fmt.Println("服务启动时扫描一遍文件目录, 正在将未上报的内容进行上报")
-			filepath.Walk(w.dirPath, func(path string, info os.FileInfo, err error) error {
-				if err != nil {
-					fmt.Printf("遍历文件夹(%v)失败: %v\n", path, err)
-					return err
-				}
+	fmt.Println("服务启动时扫描一遍文件目录, 正在将未上报的内容进行上报")
+	filepath.Walk(w.dirPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			fmt.Printf("遍历文件夹(%v)失败: %v\n", path, err)
+			return err
+		}
 
-				if strings.HasSuffix(path, CursorFileSuffix) {
-					return nil
-				}
+		if strings.HasSuffix(path, CursorFileSuffix) {
+			return nil
+		}
 
-				if info.IsDir() || (info.Mode()&os.ModeSymlink != 0) {
-					return nil
-				}
+		if info.IsDir() || (info.Mode()&os.ModeSymlink != 0) {
+			return nil
+		}
 
-				filePath := path
-				re := regexp.MustCompile(w.fileRegexp)
-				// 使用正则表达式提取匹配的子串
-				matches := re.FindStringSubmatch(filePath)
-				if len(matches) > 0 {
-					fmt.Printf("Watching: %s\n", path)
-					go w.Watch(path)
-				}
-				return nil
-			})
-			fmt.Println("文件目录扫描结束")
-		},
-	)
+		filePath := path
+		re := regexp.MustCompile(w.fileRegexp)
+		// 使用正则表达式提取匹配的子串
+		matches := re.FindStringSubmatch(filePath)
+		if len(matches) > 0 {
+			fmt.Printf("Watching: %s\n", path)
+			go w.Watch(path)
+		}
+		return nil
+	})
+	fmt.Println("文件目录扫描结束")
 }
 
 // Watch 对单个文件进行监听
@@ -198,6 +209,7 @@ func (w *FileWatcher) Watch(filePath string) (err error) {
 		if err != nil {
 			fmt.Println(err)
 		}
+		fmt.Printf("%s 文件内容监听结束\n", filePath)
 	}()
 
 	var f *os.File
@@ -207,20 +219,20 @@ func (w *FileWatcher) Watch(filePath string) (err error) {
 	}
 	defer f.Close()
 
-	cursorPath := strings.TrimSuffix(filePath, filepath.Ext(filePath)) + CursorFileSuffix
-	offset, _ := readCursor(cursorPath)
+	cursorFile := strings.TrimSuffix(filePath, filepath.Ext(filePath)) + CursorFileSuffix
+	offset, _ := readCursor(cursorFile)
 	if _, err = f.Seek(offset, io.SeekStart); err != nil {
 		return fmt.Errorf("设置初始seek失败: %w", err)
 	}
 	fmt.Printf("准备读取文件, file: %s, offset: %d\n", filePath, offset)
 
-	// 创建一个文件监控器
-	watcher, err := fsnotify.NewWatcher()
+	// 打开游标文件写
+	var cursorFW *os.File
+	cursorFW, err = os.OpenFile(cursorFile, os.O_WRONLY|os.O_CREATE, os.ModePerm)
 	if err != nil {
-		return fmt.Errorf("创建监控器失败: %w", err)
+		return fmt.Errorf("打开游标文件失败: %w", err)
 	}
-	defer watcher.Close()
-	watcher.Add(filePath)
+	defer cursorFW.Close()
 
 	maxNoUpdateTime := 4 * time.Hour
 	timer := time.NewTicker(maxNoUpdateTime)
@@ -235,65 +247,136 @@ func (w *FileWatcher) Watch(filePath string) (err error) {
 		longTimeNoUpdate = true
 	}
 
+	scanChan := make(chan bool, 2)
+	go w.watchFileEvent(filePath, scanChan)
+
+	// 计时器, 2秒内至少发送一次
+	maxSendDur := 2 * time.Second
+	sendTimer := time.NewTicker(maxSendDur)
+	defer sendTimer.Stop()
+
+	const maxBatchCnt = 1000
+	var batchLog = bytes.NewBuffer(make([]byte, 0, 1024*1024)) // 申请1M容量
+	var batchCnt int
+	for {
+		select {
+		case ifScan := <-scanChan:
+			if !ifScan { // false表示不需要再扫描了
+				return nil
+			}
+			scanner := bufio.NewScanner(f)
+			for scanner.Scan() {
+				batchCnt++
+				line := scanner.Bytes()
+				// 更新光标位置
+				offset, _ = f.Seek(0, io.SeekCurrent)
+
+				eof := string(line) == w.completeMarker
+				line = append(line, '\n')
+				batchLog.Write(line)
+				if eof || batchCnt >= maxBatchCnt {
+					w.ResChan <- FileContent{FilePath: filePath, Content: batchLog.Bytes(), EOF: eof}
+					batchLog.Reset()
+					batchCnt = 0
+					sendTimer.Reset(maxSendDur)
+
+					// 保存光标信息到配置文件
+					err = saveCursor(cursorFW, offset)
+					if err != nil {
+						// 处理保存光标信息失败的情况
+						fmt.Println("Error saving cursor to config:", err)
+					}
+				}
+				if eof {
+					fmt.Printf("%s 文件读取完毕, 开始清理...\n", filePath)
+					if err = os.Remove(filePath); err != nil {
+						fmt.Printf("删除log文件失败: %v\n", err)
+						return
+					}
+					if err = os.Remove(cursorFile); err != nil {
+						fmt.Printf("删除cursor文件失败: %v\n", err)
+						return
+					}
+					fmt.Printf("%s '.log'、'.cursor'文件清理完毕\n", strings.TrimSuffix(filePath, ".log"))
+					return
+				}
+			}
+			if scanner.Err() != nil {
+				fmt.Printf("扫描文件(%s)时发生错误: %v\n", filePath, err)
+			}
+		case <-sendTimer.C:
+			if batchLog.Len() > 0 {
+				w.ResChan <- FileContent{FilePath: filePath, Content: batchLog.Bytes(), EOF: false}
+				batchLog.Reset()
+				batchCnt = 0
+
+				// 保存光标信息到配置文件
+				err = saveCursor(cursorFW, offset)
+				if err != nil {
+					// 处理保存光标信息失败的情况
+					fmt.Println("Error saving cursor to config:", err)
+					continue
+				}
+			}
+
+			if longTimeNoUpdate {
+				fmt.Printf("%s 长时间(%v)未更新, 认为文件读取完毕, 不再监控\n", filePath, maxNoUpdateTime)
+				return nil
+			}
+			sendTimer.Reset(maxSendDur)
+		}
+	}
+}
+
+func (w *FileWatcher) watchFileEvent(filePath string, scanChan chan bool) {
+	defer fmt.Printf("%s 文件事件监听完成\n", filePath)
+	// 创建一个文件监控器
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		fmt.Printf("%s 文件创建监控器失败: %v\n", err, filePath)
+		scanChan <- false
+		return
+	}
+	defer watcher.Close()
+	watcher.Add(filePath)
+
 	go func() {
 		// 为了立即读一次, 直接发一个Event触发下
 		watcher.Events <- fsnotify.Event{Name: "Read Now", Op: fsnotify.Write}
 	}()
 
+	timer := time.NewTicker(w.maxNoUpdateTime)
+	defer timer.Stop()
+
 	// 监听文件变化事件
 	for {
 		select {
-		case event := <-watcher.Events:
-			var eof = false
+		case event, ok := <-watcher.Events:
+			if !ok {
+				fmt.Printf("%s watcher.Events被关闭了\n", filePath)
+				scanChan <- false
+				return
+			}
 			// 只关注Write事件，表示文件有新内容
 			if event.Op&fsnotify.Write == fsnotify.Write {
-				scanner := bufio.NewScanner(f)
-				for scanner.Scan() {
-					line := scanner.Text()
-
-					eof = line == w.completeMarker
-					w.ResChan <- FileContent{FilePath: filePath, Content: line + "\n", EOF: eof}
-
-					// 更新光标位置
-					offset, _ := f.Seek(0, io.SeekCurrent)
-
-					// 保存光标信息到配置文件
-					err = saveCursor(cursorPath, offset)
-					if err != nil {
-						// 处理保存光标信息失败的情况
-						fmt.Println("Error saving cursor to config:", err)
-						continue
-					}
-					timer.Reset(maxNoUpdateTime)
+				if len(scanChan) <= 1 {
+					scanChan <- true
 				}
-
-				if longTimeNoUpdate {
-					fmt.Printf("%s 长时间(%v)未更新, 认为文件读取完毕, 不再监控\n", filePath, maxNoUpdateTime)
-					return nil
-				}
+				timer.Reset(w.maxNoUpdateTime)
 			}
 			if event.Op&fsnotify.Remove == fsnotify.Remove {
 				fmt.Printf("%s 文件读取完毕\n", filePath)
-				return nil
-			}
-
-			if eof && w.removeAfterComplete {
-				fmt.Printf("%s 文件读取完毕, 开始清理...\n", filePath)
-				if err = os.Remove(filePath); err != nil {
-					return fmt.Errorf("删除文件(%s)失败: %w", filePath, err)
-				}
-
-				if err = os.Remove(cursorPath); err != nil {
-					return fmt.Errorf("删除cursor文件失败: %w", err)
-				}
-				fmt.Printf("文件已被清理: %s、%s\n", filePath, cursorPath)
-				return nil
+				scanChan <- false
+				return
 			}
 		case e := <-watcher.Errors:
-			return fmt.Errorf("watcher.Errors: %w", e)
+			fmt.Printf("watcher.Errors: %v\n", e)
+			scanChan <- false
+			return
 		case <-timer.C:
-			fmt.Printf("%s 长时间(%v)未更新, 认为文件读取完毕, 不再监控\n", filePath, maxNoUpdateTime)
-			return nil
+			fmt.Printf("%s 长时间(%v)未更新, 认为文件读取完毕, 不再监控\n", filePath, w.maxNoUpdateTime)
+			scanChan <- false
+			return
 		}
 	}
 }
@@ -306,12 +389,11 @@ func readCursor(cursorPath string) (int64, error) {
 	return strconv.ParseInt(string(data), 10, 64)
 }
 
-func saveCursor(cursorPath string, offset int64) error {
-	f, err := os.OpenFile(cursorPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, os.ModePerm)
-	if err != nil {
+func saveCursor(f *os.File, offset int64) error {
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
-	_, err = f.WriteString(fmt.Sprintf("%d", offset))
+	_, err := f.WriteString(fmt.Sprintf("%d", offset))
 	return err
 }
 

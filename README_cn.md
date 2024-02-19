@@ -21,7 +21,6 @@ func main() {
 	watcher.SetWatchDir("./logs")
 	watcher.SetRemoveAfterComplete(true)
 
-	watcher.Scan()
 	go func() {
 		for info := range watcher.GetResChan() {
 			fmt.Printf("%+v\n", info)
